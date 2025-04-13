@@ -16,6 +16,12 @@ processed_messages = set()
 def translator_slackbot(req: func.HttpRequest) -> func.HttpResponse:
     try:
         req_body = req.get_json()
+        
+        # SlackのURL検証への対応
+        if "type" in req_body and req_body["type"] == "url_verification":
+            challenge = req_body.get("challenge")
+            return func.HttpResponse(challenge, status_code=200)
+        
         event = req_body.get("event", {})
         event_id = req_body.get("event_id")  # イベントID取得
         text = event.get("text")
