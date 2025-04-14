@@ -27,6 +27,7 @@ def translator_slackbot(req: func.HttpRequest) -> func.HttpResponse:
         text = event.get("text")
         channel = event.get("channel")
         user_id = event.get("user")  # メッセージ送信者のユーザーID
+        thread_ts = event.get("thread_ts")  # スレッドのタイムスタンプを取得
 
         # BOT自身のユーザーIDを環境変数から取得
         bot_user_id = os.getenv("SLACK_BOT_USER_ID", "")
@@ -60,8 +61,8 @@ def translator_slackbot(req: func.HttpRequest) -> func.HttpResponse:
         if translated_text == "Translation failed":
             return func.HttpResponse("Translation failed", status_code=500)
 
-        # 翻訳結果をSlackに送信
-        send_to_slack(translated_text, channel)
+        # 翻訳結果をSlackに送信（スレッドIDを渡す）
+        send_to_slack(translated_text, channel, thread_ts)
 
         logging.info(f"Message processed successfully: {event_id}")
         return func.HttpResponse("Event processed successfully", status_code=200)
@@ -119,7 +120,7 @@ def translate_text(text: str, detected_lang: str) -> str:
         logging.error(f"Translation API error: {e}")
         return "Translation failed"
 
-def send_to_slack(text: str, channel: str):
+def send_to_slack(text: str, channel: str, thread_ts: str = None):
     """翻訳結果をSlackに送信"""
     slack_token = os.getenv("SLACK_BOT_TOKEN", "")
     if not slack_token:
@@ -128,6 +129,11 @@ def send_to_slack(text: str, channel: str):
 
     client = WebClient(token=slack_token)
     try:
-        client.chat_postMessage(channel=channel, text=text)
+        # thread_tsをオプションで追加
+        client.chat_postMessage(
+            channel=channel,
+            text=text,
+            thread_ts=thread_ts  # スレッド内投稿用
+        )
     except SlackApiError as e:
         logging.error(f"Slack API error: {e.response.get('error')}")
