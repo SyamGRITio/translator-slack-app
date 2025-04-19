@@ -6,134 +6,81 @@ from slack_sdk.errors import SlackApiError
 import azure.functions as func
 
 logging.basicConfig(level=logging.DEBUG)
+processed_events = set()
 
 app = func.FunctionApp()
 
-# 処理済みイベントを保持するセット
-processed_messages = set()
-
 @app.route(route="translator_slackbot", auth_level=func.AuthLevel.FUNCTION)
 def translator_slackbot(req: func.HttpRequest) -> func.HttpResponse:
+    global processed_events
     try:
         req_body = req.get_json()
-        
-        # SlackのURL検証への対応
-        if "type" in req_body and req_body["type"] == "url_verification":
-            challenge = req_body.get("challenge")
-            return func.HttpResponse(challenge, status_code=200)
-        
+
+        # SlackのURL検証
+        if req_body.get("type") == "url_verification":
+            return func.HttpResponse(req_body.get("challenge"), status_code=200)
+
+        # イベントデータの取得と必須フィールドチェック
         event = req_body.get("event", {})
-        event_id = req_body.get("event_id")  # イベントID取得
         text = event.get("text")
         channel = event.get("channel")
-        user_id = event.get("user")  # メッセージ送信者のユーザーID
-        thread_ts = event.get("thread_ts")  # スレッドのタイムスタンプを取得
+        user_id = event.get("user")
+        event_ts = event.get("ts")
+        thread_ts = event.get("thread_ts")
+        bot_id = event.get("bot_id")
 
-        # BOT自身のユーザーIDを環境変数から取得
-        bot_user_id = os.getenv("SLACK_BOT_USER_ID", "")
-
-        # 必須フィールドチェック
-        if not text or not channel or not event_id or not user_id:
-            logging.warning("Missing required fields: 'text', 'channel', 'event_id', or 'user'")
+        if not text or not channel or not event_ts:
             return func.HttpResponse("Invalid payload", status_code=400)
 
-        # BOT自身のメッセージを無視（再翻訳防止）
-        if user_id == bot_user_id:
-            logging.info("Message from bot itself ignored")
-            return func.HttpResponse("Message from bot ignored", status_code=200)
+        # BOT自身のメッセージまたはイベント重複防止
+        bot_user_id = os.getenv("SLACK_BOT_USER_ID", "")
+        if user_id == bot_user_id or bot_id or event_ts in processed_events:
+            return func.HttpResponse("Message from bot ignored or duplicate event", status_code=200)
 
-        # 重複イベントのフィルタリング
-        if event_id in processed_messages:
-            logging.info("Duplicate event ignored")
-            return func.HttpResponse("Event already processed", status_code=200)
+        processed_events.add(event_ts)
 
-        # 処理済みイベントとして記録
-        processed_messages.add(event_id)
-
-        # 言語検出処理
+        # 言語検出と翻訳処理
         detected_lang = detect_language(text)
         if detected_lang == "unknown":
-            logging.warning("Language detection failed")
             return func.HttpResponse("Language detection failed", status_code=500)
 
-        # 翻訳処理
         translated_text = translate_text(text, detected_lang)
-        if translated_text == "Translation failed":
-            return func.HttpResponse("Translation failed", status_code=500)
+        send_to_slack(translated_text, channel, thread_ts or event_ts)
 
-        # 翻訳結果をSlackに送信（スレッドIDを渡す）
-        send_to_slack(translated_text, channel, thread_ts)
-
-        logging.info(f"Message processed successfully: {event_id}")
         return func.HttpResponse("Event processed successfully", status_code=200)
     except Exception as e:
         logging.error(f"Function error: {e}")
         return func.HttpResponse("Internal Server Error", status_code=500)
 
 def detect_language(text: str) -> str:
-    """Azure Translator APIで言語を検出"""
+    """Azure Translator APIで言語検出"""
     endpoint = os.getenv("TRANSLATOR_ENDPOINT", "").rstrip('/')
-    key = os.getenv("TRANSLATOR_KEY", "")
-    region = os.getenv("TRANSLATOR_REGION", "")
-
     headers = {
-        "Ocp-Apim-Subscription-Key": key,
-        "Ocp-Apim-Subscription-Region": region,
+        "Ocp-Apim-Subscription-Key": os.getenv("TRANSLATOR_KEY", ""),
+        "Ocp-Apim-Subscription-Region": os.getenv("TRANSLATOR_REGION", ""),
         "Content-Type": "application/json",
     }
     body = [{"text": text}]
-    
-    try:
-        response = requests.post(f"{endpoint}/detect?api-version=3.0", headers=headers, json=body)
-        response.raise_for_status()
-        detected_lang = response.json()[0]["language"]
-        return detected_lang
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Language detection error: {e}")
-        return "unknown"
+    response = requests.post(f"{endpoint}/detect?api-version=3.0", headers=headers, json=body)
+    response.raise_for_status()
+    return response.json()[0]["language"]
 
 def translate_text(text: str, detected_lang: str) -> str:
     """Azure Translator APIで翻訳"""
     endpoint = os.getenv("TRANSLATOR_ENDPOINT", "").rstrip('/')
-    key = os.getenv("TRANSLATOR_KEY", "")
-    region = os.getenv("TRANSLATOR_REGION", "")
-
-    if not endpoint or not key or not region:
-        logging.error("Translation API configuration is missing")
-        return "Translation failed"
-
     headers = {
-        "Ocp-Apim-Subscription-Key": key,
-        "Ocp-Apim-Subscription-Region": region,
+        "Ocp-Apim-Subscription-Key": os.getenv("TRANSLATOR_KEY", ""),
+        "Ocp-Apim-Subscription-Region": os.getenv("TRANSLATOR_REGION", ""),
         "Content-Type": "application/json",
     }
-    body = [{"text": text}]
     target_lang = "ja" if detected_lang == "en" else "en"
-    
-    try:
-        response = requests.post(f"{endpoint}/translate?api-version=3.0&to={target_lang}", headers=headers, json=body)
-        response.raise_for_status()
-
-        translations = response.json()[0]["translations"]
-        return translations[0]["text"] if translations else "Translation failed"
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Translation API error: {e}")
-        return "Translation failed"
+    body = [{"text": text}]
+    response = requests.post(f"{endpoint}/translate?api-version=3.0&to={target_lang}", headers=headers, json=body)
+    response.raise_for_status()
+    return response.json()[0]["translations"][0]["text"]
 
 def send_to_slack(text: str, channel: str, thread_ts: str = None):
-    """翻訳結果をSlackに送信"""
+    """Slackに翻訳結果を送信"""
     slack_token = os.getenv("SLACK_BOT_TOKEN", "")
-    if not slack_token:
-        logging.error("Slack token is missing")
-        return
-
     client = WebClient(token=slack_token)
-    try:
-        # thread_tsをオプションで追加
-        client.chat_postMessage(
-            channel=channel,
-            text=text,
-            thread_ts=thread_ts  # スレッド内投稿用
-        )
-    except SlackApiError as e:
-        logging.error(f"Slack API error: {e.response.get('error')}")
+    client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
