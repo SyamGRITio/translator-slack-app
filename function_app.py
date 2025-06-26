@@ -1,86 +1,103 @@
 import logging
-import requests
 import os
+import openai
+import azure.functions as func
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-import azure.functions as func
 
-logging.basicConfig(level=logging.DEBUG)
+# ログレベル設定（INFO以上を出力）
+logging.basicConfig(level=logging.INFO)
 processed_events = set()
 
+# Azure OpenAI 設定 (環境変数から読み込み)
+openai.api_type    = "azure"
+openai.api_base    = os.getenv("OPENAI_ENDPOINT", "").rstrip("/")
+openai.api_key     = os.getenv("OPENAI_KEY", "")
+openai.api_version = "2024-12-01-preview"
+DEPLOYMENT_ID      = os.getenv("OPENAI_DEPLOYMENT", "")
+
+# FunctionApp オブジェクト生成
 app = func.FunctionApp()
 
-@app.route(route="translator_slackbot", auth_level=func.AuthLevel.FUNCTION)
+# HTTP トリガー定義
+@app.function_name(name="translator_slackbot")
+@app.route(
+    route="translator_slackbot",
+    methods=["POST"],
+    auth_level=func.AuthLevel.FUNCTION
+)
 def translator_slackbot(req: func.HttpRequest) -> func.HttpResponse:
-    global processed_events
     try:
-        req_body = req.get_json()
+        payload = req.get_json()
+        # 受信ペイロードをログ出力
+        logging.info(f"[RECV ] Received payload: {payload}")
 
-        # SlackのURL検証
-        if req_body.get("type") == "url_verification":
-            return func.HttpResponse(req_body.get("challenge"), status_code=200)
+        # Slack URL 検証
+        if payload.get("type") == "url_verification":
+            return func.HttpResponse(payload.get("challenge"), status_code=200)
 
-        # イベントデータの取得と必須フィールドチェック
-        event = req_body.get("event", {})
-        text = event.get("text")
-        channel = event.get("channel")
-        user_id = event.get("user")
-        event_ts = event.get("ts")
-        thread_ts = event.get("thread_ts")
-        bot_id = event.get("bot_id")
+        ev = payload.get("event", {})
+        text      = ev.get("text")
+        channel   = ev.get("channel")
+        user_id   = ev.get("user")
+        ts        = ev.get("ts")
+        thread_ts = ev.get("thread_ts") or ts
+        bot_id    = os.getenv("SLACK_BOT_USER_ID", "")
 
-        if not text or not channel or not event_ts:
+        # 無効／Bot自身／重複イベントを除外
+        if not text or not channel or not ts:
             return func.HttpResponse("Invalid payload", status_code=400)
+        if user_id == bot_id or ev.get("bot_id") or ts in processed_events:
+            return func.HttpResponse(status_code=200)
+        processed_events.add(ts)
 
-        # BOT自身のメッセージまたはイベント重複防止
-        bot_user_id = os.getenv("SLACK_BOT_USER_ID", "")
-        if user_id == bot_user_id or bot_id or event_ts in processed_events:
-            return func.HttpResponse("Message from bot ignored or duplicate event", status_code=200)
+        # 言語検出→翻訳
+        lang        = detect_language(text)
+        translation = translate_text(text, lang)
+        # 検出結果と翻訳結果をログ出力
+        logging.info(f"[XLT  ] Detected={lang}, Translated={translation}")
 
-        processed_events.add(event_ts)
+        # Slack に送信
+        send_to_slack(translation, channel, thread_ts)
+        return func.HttpResponse("OK", status_code=200)
 
-        # 言語検出と翻訳処理
-        detected_lang = detect_language(text)
-        if detected_lang == "unknown":
-            return func.HttpResponse("Language detection failed", status_code=500)
-
-        translated_text = translate_text(text, detected_lang)
-        send_to_slack(translated_text, channel, thread_ts or event_ts)
-
-        return func.HttpResponse("Event processed successfully", status_code=200)
     except Exception as e:
         logging.error(f"Function error: {e}")
         return func.HttpResponse("Internal Server Error", status_code=500)
 
+
 def detect_language(text: str) -> str:
-    """Azure Translator APIで言語検出"""
-    endpoint = os.getenv("TRANSLATOR_ENDPOINT", "").rstrip('/')
-    headers = {
-        "Ocp-Apim-Subscription-Key": os.getenv("TRANSLATOR_KEY", ""),
-        "Ocp-Apim-Subscription-Region": os.getenv("TRANSLATOR_REGION", ""),
-        "Content-Type": "application/json",
-    }
-    body = [{"text": text}]
-    response = requests.post(f"{endpoint}/detect?api-version=3.0", headers=headers, json=body)
-    response.raise_for_status()
-    return response.json()[0]["language"]
+    """GPT-4o で言語検出"""
+    resp = openai.ChatCompletion.create(
+        deployment_id=DEPLOYMENT_ID,
+        messages=[
+            {"role": "system", "content": "Detect the language of the following text and return only the ISO 639-1 code."},
+            {"role": "user",   "content": text}
+        ],
+        max_tokens=5
+    )
+    return resp.choices[0].message.content.strip().strip('"')
+
 
 def translate_text(text: str, detected_lang: str) -> str:
-    """Azure Translator APIで翻訳"""
-    endpoint = os.getenv("TRANSLATOR_ENDPOINT", "").rstrip('/')
-    headers = {
-        "Ocp-Apim-Subscription-Key": os.getenv("TRANSLATOR_KEY", ""),
-        "Ocp-Apim-Subscription-Region": os.getenv("TRANSLATOR_REGION", ""),
-        "Content-Type": "application/json",
-    }
-    target_lang = "ja" if detected_lang == "en" else "en"
-    body = [{"text": text}]
-    response = requests.post(f"{endpoint}/translate?api-version=3.0&to={target_lang}", headers=headers, json=body)
-    response.raise_for_status()
-    return response.json()[0]["translations"][0]["text"]
+    """GPT-4o で翻訳"""
+    target = "ja" if detected_lang == "en" else "en"
+    prompt = f"Translate the following text into {target}. Respond with translated text only.\n\n{text}"
+    resp = openai.ChatCompletion.create(
+        deployment_id=DEPLOYMENT_ID,
+        messages=[
+            {"role": "system", "content": "You are a translation service."},
+            {"role": "user",   "content": prompt}
+        ],
+        max_tokens=1000
+    )
+    return resp.choices[0].message.content.strip()
+
 
 def send_to_slack(text: str, channel: str, thread_ts: str = None):
-    """Slackに翻訳結果を送信"""
-    slack_token = os.getenv("SLACK_BOT_TOKEN", "")
-    client = WebClient(token=slack_token)
-    client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
+    """Slack にメッセージを送信"""
+    client = WebClient(token=os.getenv("SLACK_BOT_TOKEN", ""))
+    try:
+        client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
+    except SlackApiError as err:
+        logging.error(f"Slack API error: {err}")
