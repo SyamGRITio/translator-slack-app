@@ -1,100 +1,64 @@
-プロジェクト概要
-このリポジトリには、Azure Functionsと統合されたSlack BOTが含まれています。このBOTは、Azure Translator APIを使用して、メッセージをリアルタイムで翻訳します。英語と日本語間の翻訳をサポートし、BOT自身の発言を再翻訳しないような仕組みも備えています。
+# Translator Slack App
 
-ファイル構成
-├── .funcignore           # Azure Functionsデプロイ時に無視するファイルやディレクトリを指定。
-├── .gitignore            # Gitでバージョン管理から除外するファイルやディレクトリを指定。
-├── function_app.py       # 翻訳機能を実行するAzure Functionのメインコード。
-├── host.json             # Azure Functionsホストランタイムの設定ファイル。
-├── local.settings.json   # Azure Functions用のローカル環境変数設定。
-├── requirements.txt      # Pythonの依存ライブラリを記載したファイル。
-├── __pycache__/          # Pythonのバイトコードキャッシュ（自動生成される）。
-├── .vscode/              # VSCode用のプロジェクト設定:
-│   ├── extensions.json   # 推奨拡張機能のリスト。
-│   ├── launch.json       # デバッグ設定ファイル。
-│   ├── settings.json     # VSCode固有の設定。
-│   ├── tasks.json        # タスクのビルドや自動化の設定。
+**オフショアチームと日本側メンバーのコミュニケーションを支援する Slack 翻訳 Bot** です。
+Slack チャンネル上の発言を自動で日↔英翻訳し、元メッセージのスレッドに翻訳結果を返信します。発言者は通常通り母国語で投稿するだけで、相手はそのスレッドを開けば翻訳された内容を確認できます。
 
-
+## このプロジェクトについて
 
-機能
-- Azure Translator APIを活用したリアルタイム翻訳。
-- Slack BOT統合によるシームレスなメッセージ処理。
-- BOT自身の発言を無視し、不要な翻訳を防止。
-- Azure Functionsと簡単に統合可能。
+オフショア開発体制での日本メンバーとのコミュニケーションロスを減らすことを目的に開発しました。Slack の Events API + Azure Functions で構築しています。
 
+本リポジトリには**2つの実装バージョン**が保存されています。当初 Azure Translator API で構築しましたが、翻訳精度・モデル選択の柔軟性を求めて Azure OpenAI へ移行しました。学習・比較用に旧版も残しています。
 
-セットアップ手順
-1. Slack BOTのセットアップ
-1.1 アプリを作成
-- Slack API管理ページにアクセスして、新しいアプリを作成します。
-- **「Create New App」**をクリック。
-- **「From scratch」**を選択し、以下を入力：- App Name: アプリ名（例: MySlackBot）。
-- Workspace: BOTをインストールするワークスペースを選択。
+## 2つのバージョン
 
+| ディレクトリ | 翻訳エンジン | 状態 | 特徴 |
+|---|---|---|---|
+| [`azure-openai/`](./azure-openai/) | Azure OpenAI (GPT-4o 等) | **現行版（推奨）** | 高い翻訳精度、モデル選択可、コンテキスト考慮 |
+| [`azure-translator/`](./azure-translator/) | Azure Translator API v3 | 旧版（参考） | シンプル、低コスト、無料枠あり |
 
-1.2 OAuth & Permissionsの設定
-- アプリ管理ページの左メニューから**「OAuth & Permissions」**セクションを選択。
-- 以下のスコープを追加：- commands
-- chat:write
-- users:read
+### なぜ移行したか
 
-- 保存後、**「Install App to Workspace」**をクリックしてアプリをワークスペースにインストール。
-- インストールが成功すると**Bot Token（xoxb-...）**が表示されます。このトークンを記録してください。
+- **精度**: Azure Translator は一般的な翻訳は得意だが、IT用語やチーム固有の文脈（プロジェクト名、略語、カジュアルな言い回し）で誤訳が目立った。GPT-4o はコンテキストを汲んだ自然な翻訳が可能
+- **モデル選択の柔軟性**: Azure OpenAI なら GPT-4o / GPT-4o-mini / o1 などモデルを切替可能。コストと精度のバランスをチーム要件に合わせて調整できる
+- **プロンプト制御**: システムプロンプトで「チームの技術用語は訳さない」「敬語で統一」等の制約を与えられる
 
-1.3 イベントサブスクリプションの設定
-- アプリ管理ページの左メニューから**「Event Subscriptions」**セクションを選択。
-- **「Enable Events」**をオンにする。
-- **「Request URL」**にAzure関数アプリのエンドポイントを入力：https://<your-function-app-name>.azurewebsites.net/api/translator_slackbot
-
-- **「Subscribe to Bot Events」**で以下のイベントを追加：- message.channels（パブリックチャネル用）
-- message.im（DM用）
+### どちらを選ぶべきか
 
-- 保存して設定を適用します。
+- **精度重視・チーム固有用語を扱う** → `azure-openai/`
+- **コスト最優先・シンプルな汎用翻訳で十分** → `azure-translator/`
 
+## 共通アーキテクチャ
 
-2. SLACK_BOT_TOKENとSLACK_BOT_USER_IDの取得
-- ターミナルまたはコマンドプロンプトで以下のコマンドを実行：curl -X POST \
--H "Authorization: Bearer xoxb-<your-bot-token>" \
-https://slack.com/api/auth.test
+```
+Slack ──(Events API)──▶ Azure Functions (Python v2)
+                              │
+                              ├──▶ 翻訳エンジン
+                              │    （Azure OpenAI or Azure Translator）
+                              │
+                              └──▶ Slack chat.postMessage
+                                   （元メッセージのスレッドに返信）
+```
 
-- レスポンス例：{
-  "ok": true,
-  "url": "https://your-workspace.slack.com/",
-  "team": "Your Team Name",
-  "user": "Your Bot Name",
-  "team_id": "T12345678",
-  "user_id": "U12345678"
-}
+- **Azure Functions (Python v2 programming model)** でイベント受信・処理
+- Slack の `message.channels` / `message.im` イベントをサブスクライブ
+- Bot 自身の発言・重複イベントは除外（インメモリの `processed_events` セットで管理）
+- 翻訳結果は `thread_ts` 指定でスレッド返信として投稿
 
-- user_idの値（例: U12345678）をSLACK_BOT_USER_IDとして環境変数に設定します。
+## 技術スタック
 
+| レイヤー | 技術 |
+|---|---|
+| ランタイム | Python 3.x / Azure Functions v2 |
+| Slack 連携 | Slack Events API / slack_sdk |
+| 翻訳（現行） | Azure OpenAI Service (GPT-4o 等) |
+| 翻訳（旧版） | Azure Translator API v3 |
+| デプロイ | Azure Functions（VSCode 拡張 or `func` CLI） |
 
-3. Azure Functionsのセットアップ
-- function_app.pyをAzure Functionsにデプロイします。
-- Azureポータルで以下の環境変数を設定：- SLACK_BOT_TOKEN: SlackのBot Token。
-- SLACK_BOT_USER_ID: Slack APIで取得したBOTのユーザーID。
-- TRANSLATOR_ENDPOINT: Azure Translator APIのエンドポイント。
-- TRANSLATOR_KEY: Azure Translator APIのキー。
-- TRANSLATOR_REGION: Azure Translator APIのリージョン。
+## セットアップ
 
+各バージョンの README を参照してください。
 
+- [Azure OpenAI 版のセットアップ手順](./azure-openai/README.md)
+- [Azure Translator 版のセットアップ手順](./azure-translator/README.md)
 
-4. 動作確認
-- SlackのワークスペースでBOTにメッセージを送信し、翻訳が正しく行われることを確認します。
-- 必要に応じてAzureポータルのログを確認し、エラーがないかチェックします。
-
-
-依存ライブラリのインストール
-requirements.txtに記載された依存ライブラリをインストールしてください：
-pip install -r requirements.txt
-
-
-
-開発およびデバッグ
-- VSCode設定: .vscodeフォルダには以下が含まれています：- launch.json: デバッグ設定。
-- settings.json: VSCode用の設定。
-- tasks.json: 自動化タスクの設定。
-
-- デバッグを活用し、ローカル環境での動作確認が可能です。
-
+Slack アプリ側の設定（Bot 作成・OAuth スコープ・Event Subscription）は両バージョンで共通です。
