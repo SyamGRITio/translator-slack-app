@@ -114,7 +114,8 @@ curl -X POST \
 
    関数 URL は Azure ポータルの Function App → 該当関数 → **「コードとテスト」** 画面の **「関数の URL の取得」** ボタンから取得できます（`code` クエリ付きの完全 URL がコピーされます）。
 
-   <img width="600" alt="関数の URL の取得ボタン" src="REPLACE_WITH_FUNCTION_URL_IMAGE" />
+   <img width="537" height="142" alt="image" src="https://github.com/user-attachments/assets/495d4468-8687-46ac-bfa8-ffc724585a2f" />
+
 
 3. 「**Subscribe to bot events**」で以下を追加：
    - `message.channels` — パブリックチャンネルのメッセージ
